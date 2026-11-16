@@ -1,7 +1,7 @@
 """
 frontier_detection.py — frontier cells and frontier clusters.
 
-Definition (unchanged from the original framework):
+Definition (the classical one of Yamauchi, 1997, restricted to 4-connectivity):
   a frontier cell is a FREE cell with at least one CARDINAL (4-connected)
   UNKNOWN neighbor. Diagonal-only adjacency is ignored so that unknown space
   touching free space across an obstacle corner does not create a frontier.
@@ -28,6 +28,13 @@ _EIGHT_CONNECTED = np.ones((3, 3), dtype=bool)
 
 @dataclass
 class FrontierCluster:
+    """One candidate frontier: a connected group of frontier cells.
+
+    Cell indices refer to the occupancy grid (row = y, col = x). A long
+    connected frontier may be split into several clusters; each piece keeps
+    the size of the component it came from in parent_size.
+    """
+
     rows: np.ndarray            # frontier cell rows   (int)
     cols: np.ndarray            # frontier cell cols   (int)
     centroid_row: float
@@ -38,7 +45,17 @@ class FrontierCluster:
 
 
 def detect_frontier_mask(grid):
-    """Boolean mask of frontier cells for a GridMap."""
+    """Return a boolean mask of the frontier cells of a grid.
+
+    A frontier cell is a free cell with at least one unknown 4-connected
+    neighbor (see the module docstring).
+
+    Args:
+        grid: GridMap holding the current occupancy grid.
+
+    Returns:
+        Boolean array of the grid's shape; True marks a frontier cell.
+    """
     free = grid.free
     unknown = grid.unknown
 
@@ -52,7 +69,17 @@ def detect_frontier_mask(grid):
 
 
 def _label_groups(mask):
-    """Return a list of (rows, cols) arrays, one per 8-connected component."""
+    """Split a mask into its 8-connected components.
+
+    Uses SciPy when available and a breadth-first traversal otherwise; both
+    yield the same components.
+
+    Args:
+        mask: Boolean grid mask.
+
+    Returns:
+        List of (rows, cols) index arrays, one pair per component.
+    """
     rows, cols = np.nonzero(mask)
     if rows.size == 0:
         return []
@@ -98,6 +125,7 @@ def _label_groups(mask):
 
 
 def _make_cluster(rows, cols, resolution, parent_size):
+    """Build a FrontierCluster from its cell indices."""
     return FrontierCluster(
         rows=rows,
         cols=cols,
@@ -112,8 +140,21 @@ def _make_cluster(rows, cols, resolution, parent_size):
 def cluster_frontiers(grid, frontier_mask, min_length_m, max_length_m):
     """Group frontier cells into candidate clusters.
 
-    Returns (clusters, rejected_small) where rejected_small is the number of
-    connected components discarded for being shorter than min_length_m.
+    Connected components shorter than min_length_m are discarded as map
+    noise. Components longer than max_length_m are cut into world-anchored
+    square tiles, so a wide opening yields several candidates and the same
+    physical frontier is split the same way on successive maps.
+
+    Args:
+        grid: GridMap holding the current occupancy grid.
+        frontier_mask: Boolean mask from detect_frontier_mask().
+        min_length_m: Minimum frontier length [m] (cells x resolution).
+        max_length_m: Maximum frontier length before splitting [m];
+            0 or less disables splitting.
+
+    Returns:
+        Tuple (clusters, rejected_small): the list of FrontierCluster
+        candidates and the number of components discarded as too short.
     """
     res = grid.resolution
     min_cells = max(1, int(math.ceil(float(min_length_m) / res)))
@@ -137,6 +178,7 @@ def cluster_frontiers(grid, frontier_mask, min_length_m, max_length_m):
         xs, ys = grid.cells_to_world(rows, cols)
         tx = np.floor(xs / max_length_m).astype(np.int64)
         ty = np.floor(ys / max_length_m).astype(np.int64)
+        # Combine both tile indices into one sortable key (large prime stride).
         key = tx * 1000003 + ty
         order = np.argsort(key, kind='stable')
         key_sorted = key[order]

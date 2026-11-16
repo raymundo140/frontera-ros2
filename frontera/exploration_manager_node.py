@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-exploration_manager.py — Frontera (ROS 2 node)
-=============================================================
+exploration_manager_node.py — Frontera ROS 2 node
+==================================================
 Supervised frontier-exploration framework for any ROS 2 mobile robot that has
 
   * a SLAM system publishing nav_msgs/OccupancyGrid,
@@ -9,14 +9,14 @@ Supervised frontier-exploration framework for any ROS 2 mobile robot that has
   * a nav2_msgs/NavigateToPose action server (Nav2 or compatible).
 
 This file is only the ROS adapter: parameters, topics, TF and the action
-client. All decision logic lives in the `exploration` package next to it and
-has no ROS dependency (see exploration/__init__.py for the module map).
+client. All decision logic lives in the other modules of this package, which
+have no ROS dependency (see __init__.py for the module map). The node acts as
+the controller's `ports` object (see controller.py).
 
 Configuration: every setting is a ROS 2 parameter documented in
-config/frontera.yaml. Nothing robot-specific is
-hard-coded here.
+config/frontera.yaml. Nothing robot-specific is hard-coded here.
 
-State machine (unchanged external behavior):
+Control state machine (commands on the control topic):
   WAITING -> START -> RUNNING <-> PAUSE -> PAUSED
                               -> STOP  -> STOPPED
 
@@ -31,9 +31,10 @@ Key design:
   cancellation blocks new goals and is reported, never assumed.
 - Behavior durations use ROS (simulation) time; wall time is used only to
   detect a frozen clock and unresponsive components.
-- STOP does not shut down other processes. The program manager owns process
-  lifecycle; this node only stops exploring and reports STOPPED.
-- Map files are written by the program manager on request, never here.
+- STOP does not shut down other processes. Whatever launched the system
+  (a launch file or a program manager) owns process lifecycle; this node
+  only stops exploring and reports STOPPED.
+- Map files are written by that process on request, never here.
 """
 # Author: Raymundo Gomez
 
@@ -59,9 +60,9 @@ from nav_msgs.msg import OccupancyGrid, Odometry
 from std_msgs.msg import Float32, String
 from visualization_msgs.msg import Marker, MarkerArray
 
-# The framework package. To reuse this node in another ROS 2 package, copy
-# the `exploration` folder there and point this at it (or set the
-# EXPLORATION_FRAMEWORK_PACKAGE environment variable).
+# The Python package holding the framework modules. To embed the framework
+# in another ROS 2 package under a different name, set the
+# EXPLORATION_FRAMEWORK_PACKAGE environment variable to that package.
 FRAMEWORK_PACKAGE = os.environ.get(
     'EXPLORATION_FRAMEWORK_PACKAGE', 'frontera')
 
@@ -76,13 +77,15 @@ ExplorationConfig = _config.ExplorationConfig
 ExplorationController = _controller.ExplorationController
 GridMap = _grid.GridMap
 
+# NavigateToPose terminal statuses -> framework result names.
 _RESULT_NAMES = {
     GoalStatus.STATUS_SUCCEEDED: _supervisor.RESULT_SUCCEEDED,
     GoalStatus.STATUS_CANCELED: _supervisor.RESULT_CANCELED,
     GoalStatus.STATUS_ABORTED: _supervisor.RESULT_ABORTED,
 }
 
-# Marker colors per candidate class (r, g, b).
+# RViz marker colors per candidate class (r, g, b); the selected
+# candidate is drawn larger in orange.
 _CLASS_COLORS = {
     _scoring.ELIGIBLE: (0.1, 0.8, 0.2),
     _scoring.COOLDOWN: (1.0, 0.9, 0.1),
@@ -95,7 +98,22 @@ _CLASS_COLORS = {
 
 
 def _coerce(name, value, default):
-    """Convert a parameter value to the type of its default."""
+    """Convert a parameter value to the type of its default.
+
+    Parameters are declared with dynamic typing, so a YAML value such as 1
+    for a float parameter is accepted and converted here.
+
+    Args:
+        name: Parameter name, for the error message.
+        value: Value read from the parameter server.
+        default: Default value, whose type is the target type.
+
+    Returns:
+        The converted value.
+
+    Raises:
+        ValueError: If the value cannot be converted.
+    """
     try:
         if isinstance(default, bool):
             if isinstance(value, str):
@@ -120,8 +138,17 @@ def _coerce(name, value, default):
 
 
 class ExplorationManager(Node):
+    """ROS 2 node that connects the exploration controller to ROS.
+
+    Declares one parameter per ExplorationConfig field, subscribes to the
+    map, costmap, odometry and control topics, owns the NavigateToPose
+    action client, and implements every port method the controller needs.
+    All callbacks are wrapped by _guarded(), so an exception cannot stop
+    the node while a goal is active.
+    """
 
     def __init__(self):
+        """Load the parameters and create all ROS interfaces and timers."""
         super().__init__('exploration_manager')
 
         # ── parameters -> configuration ───────────────────────────────────
@@ -222,6 +249,11 @@ class ExplorationManager(Node):
     # configuration
     # =====================================================================
     def _load_config(self):
+        """Declare one ROS parameter per config field and read them all.
+
+        Returns:
+            ExplorationConfig filled from the parameter server.
+        """
         cfg = ExplorationConfig()
         descriptor = ParameterDescriptor(dynamic_typing=True)
         for name, default in ExplorationConfig.field_defaults().items():
@@ -260,6 +292,11 @@ class ExplorationManager(Node):
     # ROS callbacks -> controller
     # =====================================================================
     def _grid_from_msg(self, msg):
+        """Convert a nav_msgs/OccupancyGrid into a GridMap.
+
+        Warns once if the grid origin is rotated, since the framework
+        assumes an axis-aligned grid.
+        """
         info = msg.info
         q = info.origin.orientation
         if (abs(q.x) > 1e-3 or abs(q.y) > 1e-3 or abs(q.z) > 1e-3) \
@@ -276,6 +313,7 @@ class ExplorationManager(Node):
             occupied_min=self.cfg.map_occupied_min_value)
 
     def _map_cb(self, msg):
+        """Forward a new map to the controller; adopt its frame if unset."""
         try:
             grid = self._grid_from_msg(msg)
         except Exception as exc:
@@ -286,6 +324,7 @@ class ExplorationManager(Node):
         self.controller.on_map(grid)
 
     def _costmap_cb(self, msg):
+        """Forward a new global costmap to the controller."""
         try:
             self.controller.on_costmap(self._grid_from_msg(msg))
         except Exception as exc:
@@ -293,13 +332,16 @@ class ExplorationManager(Node):
                 'bad_costmap', 5.0, 'warn', f'Ignoring costmap: {exc}')
 
     def _odom_cb(self, msg):
+        """Remember the odometry frames, used as TF fallbacks for the pose."""
         self._odom_child_frame = str(msg.child_frame_id).strip().lstrip('/')
         self._odom_frame_from_msg = str(msg.header.frame_id).strip().lstrip('/')
 
     def _control_cb(self, msg):
+        """Forward an operator command to the controller."""
         self.controller.on_command(msg.data)
 
     def _throttled(self, key, period_s, level, text):
+        """Log at most once per period_s of wall time per key."""
         now = time.monotonic()
         if now - self._wall_log.get(key, -1e18) >= period_s:
             self._wall_log[key] = now
@@ -309,12 +351,15 @@ class ExplorationManager(Node):
     # ports used by the controller
     # =====================================================================
     def ros_now(self):
+        """Port: current ROS time [s] (simulation time if enabled)."""
         return self.get_clock().now().nanoseconds * 1e-9
 
     def wall_now(self):
+        """Port: current monotonic wall time [s]."""
         return time.monotonic()
 
     def log(self, level, text):
+        """Port: log text at 'error', 'warn', 'info' or 'debug' level."""
         # rclpy caches the severity of each logging call site (file + line)
         # and raises if one line is used with different severities. Each
         # severity therefore needs its own call line here.
@@ -330,6 +375,11 @@ class ExplorationManager(Node):
 
     # ── pose ─────────────────────────────────────────────────────────────
     def _base_frames(self):
+        """Return candidate robot base frames in order of preference.
+
+        The configured base frame first, then the odometry child frame (if
+        enabled), then the configured fallbacks, without duplicates.
+        """
         frames = [self.cfg.robot_base_frame]
         if self.cfg.use_odom_child_frame and self._odom_child_frame:
             frames.append(self._odom_child_frame)
@@ -342,7 +392,16 @@ class ExplorationManager(Node):
         return unique
 
     def _stamp_problem(self, tr, now_s, max_age_s):
-        """Return None if the transform's stamp is acceptable, else why."""
+        """Check the timestamp of a transform.
+
+        Args:
+            tr: geometry_msgs/TransformStamped.
+            now_s: Current ROS time [s].
+            max_age_s: Maximum accepted age [s]; 0 disables the age check.
+
+        Returns:
+            None if the stamp is acceptable, otherwise a short reason.
+        """
         stamp = tr.header.stamp.sec + tr.header.stamp.nanosec * 1e-9
         if stamp <= 0.0:
             return None if self.cfg.tf_accept_zero_stamp else 'unstamped'
@@ -355,7 +414,11 @@ class ExplorationManager(Node):
 
     @staticmethod
     def _planar(tr):
-        """(x, y, yaw) of a transform, or None if it is not finite."""
+        """Return the planar (x, y, yaw) of a transform [m, m, rad].
+
+        Returns:
+            The planar pose, or None if any component is not finite.
+        """
         t = tr.transform.translation
         q = tr.transform.rotation
         if not all(math.isfinite(v) for v in (t.x, t.y, q.x, q.y, q.z, q.w)):
@@ -366,11 +429,12 @@ class ExplorationManager(Node):
         return float(t.x), float(t.y), float(yaw)
 
     def _odom_frame_name(self):
+        """Return the configured odometry frame, else the one from odometry."""
         frame = self.cfg.odom_frame.strip().lstrip('/')
         return frame or self._odom_frame_from_msg
 
     def get_pose(self):
-        """Fresh (x, y, yaw) of the robot in the map frame, or None.
+        """Port: fresh (x, y, yaw) of the robot in the map frame, or None.
 
         1. Direct lookup map -> base, accepted if at most tf_max_age_s old.
         2. Otherwise, if the odometry frame is known, map -> odom and
@@ -438,6 +502,7 @@ class ExplorationManager(Node):
         return None
 
     def reset_tf(self):
+        """Port: drop all buffered transforms (after a clock reset)."""
         try:
             self.tf_buffer.clear()
         except Exception as exc:
@@ -445,9 +510,11 @@ class ExplorationManager(Node):
 
     # ── navigation action ────────────────────────────────────────────────
     def nav_ready(self):
+        """Port: True if the NavigateToPose action server is available."""
         return self.nav_client.server_is_ready()
 
     def _goal_pose(self, x, y, yaw):
+        """Build a PoseStamped in the map frame from (x, y, yaw)."""
         pose = PoseStamped()
         pose.header.frame_id = self._global_frame or 'map'
         pose.header.stamp = self.get_clock().now().to_msg()
@@ -461,6 +528,20 @@ class ExplorationManager(Node):
         return pose
 
     def nav_send(self, txn_id, x, y, yaw):
+        """Port: send a NavigateToPose goal for a transaction.
+
+        Every callback is bound to txn_id, so the controller can tell which
+        transaction it belongs to.
+
+        Args:
+            txn_id: Transaction ID of the goal.
+            x: Goal x in the map frame [m].
+            y: Goal y in the map frame [m].
+            yaw: Goal heading [rad].
+
+        Returns:
+            True if the request was sent, False if sending raised an error.
+        """
         goal = NavigateToPose.Goal()
         goal.pose = self._goal_pose(x, y, yaw)
         try:
@@ -477,6 +558,7 @@ class ExplorationManager(Node):
         return True
 
     def _nav_response(self, txn_id, future):
+        """Forward the goal response and register the result callback."""
         try:
             handle = future.result()
         except Exception as exc:
@@ -493,6 +575,7 @@ class ExplorationManager(Node):
         self.controller.nav_goal_response(txn_id, True, handle, None)
 
     def _nav_feedback(self, txn_id, feedback_msg):
+        """Forward distance remaining and recoveries from Nav2 feedback."""
         fb = feedback_msg.feedback
         self.controller.nav_feedback(
             txn_id,
@@ -500,6 +583,7 @@ class ExplorationManager(Node):
             getattr(fb, 'number_of_recoveries', 0))
 
     def _nav_result(self, txn_id, future):
+        """Forward the terminal goal status to the controller."""
         try:
             status = future.result().status
         except Exception as exc:
@@ -509,6 +593,7 @@ class ExplorationManager(Node):
             txn_id, _RESULT_NAMES.get(status, f'STATUS_{status}'), None)
 
     def nav_cancel(self, handle):
+        """Port: request cancellation of a goal (no-op without a handle)."""
         if handle is None:
             return
         try:
@@ -518,37 +603,46 @@ class ExplorationManager(Node):
 
     # ── outputs ──────────────────────────────────────────────────────────
     def cmd_rotate(self, angular_z):
+        """Port: publish an in-place rotation command [rad/s]."""
         twist = Twist()
         twist.angular.z = float(angular_z)
         self.cmd_vel_pub.publish(twist)
 
     def publish_goal(self, x, y, yaw):
+        """Port: publish the current target pose (latched)."""
         self.goal_pub.publish(self._goal_pose(x, y, yaw))
 
     def _publish_string(self, publisher, text):
+        """Publish text as a std_msgs/String."""
         msg = String()
         msg.data = text
         publisher.publish(msg)
 
     def publish_status(self, text):
+        """Port: publish the status string."""
         self._publish_string(self.status_pub, text)
 
     def publish_stats(self, text):
+        """Port: publish the statistics line."""
         self._publish_string(self.stats_pub, text)
 
     def publish_event(self, text):
+        """Port: publish one JSON event."""
         self._publish_string(self.events_pub, text)
 
     def publish_map_save_status(self, text):
+        """Port: publish a map-save status message."""
         self._publish_string(self.map_save_status_pub, text)
 
     def request_map_save(self):
+        """Port: ask the launcher to save the map topic named in the config."""
         self.log(
             'info', f'Requesting map save of {self.cfg.map_save_topic}')
         self._publish_string(
             self.map_save_request_pub, self.cfg.map_save_topic)
 
     def point_sensor(self, bearing):
+        """Port: publish the bearing to the target [rad], if enabled."""
         if self.sensor_pub is None:
             return
         msg = Float32()
@@ -556,6 +650,13 @@ class ExplorationManager(Node):
         self.sensor_pub.publish(msg)
 
     def publish_markers(self, items):
+        """Port: publish all candidates as RViz sphere markers.
+
+        Args:
+            items: List of dictionaries with 'x', 'y' (map frame [m]),
+                'cls' (candidate class) and 'best' (True for the selected
+                candidate).
+        """
         array = MarkerArray()
         clear = Marker()
         clear.action = Marker.DELETEALL
@@ -589,6 +690,7 @@ class ExplorationManager(Node):
 
 
 def main(args=None):
+    """Entry point of the exploration_manager executable."""
     rclpy.init(args=args)
     node = ExplorationManager()
     try:

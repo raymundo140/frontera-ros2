@@ -1,3 +1,13 @@
+"""Launch the Frontera exploration node.
+
+Arguments:
+    params_file: Parameter file (default: the package's config/frontera.yaml).
+    use_sim_time: 'true' in simulation, so the node follows /clock.
+
+The node never moves the robot before START is published on the control
+topic (default /exploration/control).
+"""
+
 import os
 
 from ament_index_python.packages import get_package_share_directory
@@ -8,6 +18,7 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
+    """Return the launch description with its two arguments and the node."""
     default_params = os.path.join(
         get_package_share_directory('frontera'), 'config', 'frontera.yaml')
 

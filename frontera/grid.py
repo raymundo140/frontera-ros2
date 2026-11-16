@@ -26,7 +26,18 @@ except Exception:                       # pragma: no cover - depends on host
 
 
 def _dilate_octagon(mask, radius_cells):
-    """NumPy-only dilation used when SciPy is unavailable."""
+    """Grow a mask by about radius_cells using NumPy only.
+
+    Fallback for obstacle inflation when SciPy is unavailable. Alternating
+    4- and 8-neighbor steps approximate a disk by an octagon.
+
+    Args:
+        mask: Boolean mask to grow.
+        radius_cells: Growth radius [cells].
+
+    Returns:
+        The dilated boolean mask.
+    """
     out = mask.copy()
     steps = int(math.ceil(radius_cells))
     for i in range(steps):
@@ -45,10 +56,46 @@ def _dilate_octagon(mask, radius_cells):
 
 
 class GridMap:
+    """Snapshot of one occupancy grid with lazily cached masks.
+
+    Cell (row, col) covers x in [origin_x + col*res, origin_x + (col+1)*res)
+    and y likewise with row; cell centers are returned by cell_to_world().
+    The masks are computed on first access and then reused.
+
+    Attributes:
+        grid: Occupancy values as an int8 array of shape (height, width).
+        width: Number of columns.
+        height: Number of rows.
+        resolution: Cell size [m].
+        origin_x: x of the grid's lower-left corner in the map frame [m].
+        origin_y: y of the grid's lower-left corner in the map frame [m].
+        frame_id: Frame of the grid (normally 'map').
+        seq: Sequence number of the map, assigned by the caller.
+        free_max: Highest value still considered free.
+        occupied_min: Lowest value considered occupied.
+    """
 
     def __init__(self, data, width, height, resolution,
                  origin_x, origin_y, frame_id='map', seq=0,
                  free_max=25, occupied_min=50):
+        """Copy an occupancy grid into a new GridMap.
+
+        Args:
+            data: Flat sequence of cell values in row-major order, as in
+                nav_msgs/OccupancyGrid.data.
+            width: Number of columns.
+            height: Number of rows.
+            resolution: Cell size [m].
+            origin_x: x of the grid origin in the map frame [m].
+            origin_y: y of the grid origin in the map frame [m].
+            frame_id: Frame of the grid; empty falls back to 'map'.
+            seq: Sequence number of the map.
+            free_max: Highest value considered free.
+            occupied_min: Lowest value considered occupied.
+
+        Raises:
+            ValueError: If the size or resolution is not positive.
+        """
         self.width = int(width)
         self.height = int(height)
         self.resolution = float(resolution)
@@ -76,55 +123,78 @@ class GridMap:
     # ── basic masks (lazy, cached) ───────────────────────────────────────
     @property
     def free(self):
+        """Boolean mask of free cells (0 <= value <= free_max)."""
         if self._free is None:
             self._free = (self.grid >= 0) & (self.grid <= self.free_max)
         return self._free
 
     @property
     def unknown(self):
+        """Boolean mask of unknown cells (value < 0)."""
         if self._unknown is None:
             self._unknown = self.grid < 0
         return self._unknown
 
     @property
     def occupied(self):
+        """Boolean mask of occupied cells (value >= occupied_min)."""
         if self._occupied is None:
             self._occupied = self.grid >= self.occupied_min
         return self._occupied
 
     @property
     def known_cells(self):
+        """Number of known cells (free, uncertain or occupied)."""
         if self._known_cells is None:
             self._known_cells = int(np.count_nonzero(self.grid >= 0))
         return self._known_cells
 
     @property
     def known_area_m2(self):
+        """Known area of the map [m^2]."""
         return float(self.known_cells) * self.resolution * self.resolution
 
     # ── geometry ─────────────────────────────────────────────────────────
     def world_to_cell(self, x, y):
+        """Return the (row, col) of the cell containing map point (x, y).
+
+        The result may lie outside the grid; check it with in_bounds().
+        """
         col = int(math.floor((float(x) - self.origin_x) / self.resolution))
         row = int(math.floor((float(y) - self.origin_y) / self.resolution))
         return row, col
 
     def cell_to_world(self, row, col):
+        """Return the map-frame (x, y) of a cell center [m]."""
         return (
             self.origin_x + (float(col) + 0.5) * self.resolution,
             self.origin_y + (float(row) + 0.5) * self.resolution,
         )
 
     def cells_to_world(self, rows, cols):
+        """Vectorized cell_to_world(): return arrays (xs, ys) [m]."""
         xs = self.origin_x + (np.asarray(cols, dtype=float) + 0.5) * self.resolution
         ys = self.origin_y + (np.asarray(rows, dtype=float) + 0.5) * self.resolution
         return xs, ys
 
     def in_bounds(self, row, col):
+        """True if (row, col) lies inside the grid."""
         return 0 <= row < self.height and 0 <= col < self.width
 
     # ── obstacle inflation ───────────────────────────────────────────────
     def obstacle_mask(self, radius_m):
-        """Cells closer than radius_m to a known occupied cell (cached)."""
+        """Return the mask of cells within radius_m of a known obstacle.
+
+        Uses an exact Euclidean distance transform when SciPy is available
+        and an octagonal approximation otherwise. Results are cached per
+        radius, so all candidates of one map share the same computation.
+
+        Args:
+            radius_m: Inflation radius [m]; 0 returns the occupied mask.
+
+        Returns:
+            Boolean mask; True marks a cell too close to an obstacle.
+        """
         radius_cells = max(0.0, float(radius_m) / self.resolution)
         key = round(radius_cells, 3)
         cached = self._mask_cache.get(key)
@@ -146,7 +216,16 @@ class GridMap:
         return mask
 
     def is_clear(self, x, y, radius_m):
-        """True if no known obstacle lies within radius_m of (x, y)."""
+        """Check that no known obstacle lies within radius_m of (x, y).
+
+        Args:
+            x: Point x in the map frame [m].
+            y: Point y in the map frame [m].
+            radius_m: Required clearance [m].
+
+        Returns:
+            True if the point is inside the grid and clear; False otherwise.
+        """
         row, col = self.world_to_cell(x, y)
         if not self.in_bounds(row, col):
             return False
@@ -154,7 +233,16 @@ class GridMap:
 
     # ── local statistics ─────────────────────────────────────────────────
     def count_known_in_window(self, x, y, radius_m):
-        """Number of known cells in the square window around (x, y)."""
+        """Count known cells in the square window around (x, y).
+
+        Args:
+            x: Window center x in the map frame [m].
+            y: Window center y in the map frame [m].
+            radius_m: Half the window side [m].
+
+        Returns:
+            Number of known cells in the window (clipped to the grid).
+        """
         row, col = self.world_to_cell(x, y)
         r = int(math.ceil(float(radius_m) / self.resolution))
         r0 = max(0, row - r)
@@ -168,10 +256,12 @@ class GridMap:
     # ── alignment helpers for map-to-map comparison ──────────────────────
     @property
     def origin_cell_x(self):
+        """Grid origin x in global cell units (for map-to-map alignment)."""
         return int(round(self.origin_x / self.resolution))
 
     @property
     def origin_cell_y(self):
+        """Grid origin y in global cell units (for map-to-map alignment)."""
         return int(round(self.origin_y / self.resolution))
 
 
@@ -181,7 +271,14 @@ def map_change_pct(previous, current):
     New known cells count as change; pure growth by UNKNOWN cells does not.
     The comparison is aligned in global cell coordinates, so a moving map
     origin or a resized grid does not create a false 100 % change.
-    Returns None when either map is missing.
+
+    Args:
+        previous: Earlier GridMap, or None.
+        current: Later GridMap, or None.
+
+    Returns:
+        Changed share of the union of known cells [%]; 100 if the
+        resolutions differ, None when either map is missing.
     """
     if previous is None or current is None:
         return None
@@ -213,6 +310,7 @@ def map_change_pct(previous, current):
     union_overlap = p_known | c_known
 
     changed_overlap = int(np.count_nonzero((p_sub != c_sub) & union_overlap))
+    # Known cells outside the overlap appeared or disappeared with a resize.
     prev_outside = max(0, prev_known_total - int(np.count_nonzero(p_known)))
     curr_outside = max(0, curr_known_total - int(np.count_nonzero(c_known)))
 

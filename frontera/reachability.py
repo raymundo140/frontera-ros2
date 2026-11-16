@@ -11,7 +11,7 @@ space. It complements the navigation stack's planner; it does not replace it:
   radius, and the grid is coarsened optimistically (a coarse cell is
   traversable if ANY of its fine cells is), so narrow but passable gaps stay
   open. A false "reachable" costs one failed navigation goal, which the
-  failure memory absorbs; a false "unreachable" would lose map area.
+  exploration memory absorbs; a false "unreachable" would lose map area.
 * A candidate the wavefront cannot reach is never discarded permanently on
   this evidence alone — see the probing logic in controller.py.
 """
@@ -33,10 +33,28 @@ _SQRT2 = math.sqrt(2.0)
 
 
 class ReachabilityField:
-    """Distance field [m] over a coarsened traversability grid."""
+    """Distance field [m] over a coarsened traversability grid.
+
+    Built by compute_reachability(). Queries take fine-grid (row, col)
+    indices of the original occupancy grid and map them to coarse cells.
+
+    Attributes:
+        grid: The GridMap the field was computed on.
+        factor: Fine cells per coarse cell along each axis.
+        coarse_shape: (rows, cols) of the coarse grid.
+        cell_m: Coarse cell size [m].
+        dist: Flat array of path lengths from the start cell [m]; inf
+            where unreachable.
+        pred: Flat array of predecessor indices along the shortest paths;
+            negative at the start and at unreachable cells.
+        start_index: Flat index of the start cell.
+        start_offset_m: Distance from the robot to the start cell [m],
+            added to every reported path length.
+    """
 
     def __init__(self, grid, factor, coarse_shape, dist, pred,
                  start_index, start_offset_m):
+        """Store a computed field; see compute_reachability()."""
         self.grid = grid
         self.factor = int(factor)
         self.coarse_shape = coarse_shape
@@ -47,6 +65,7 @@ class ReachabilityField:
         self.start_offset_m = float(start_offset_m)
 
     def _index(self, row, col):
+        """Return the flat coarse index of a fine cell, or None if outside."""
         cr = int(row) // self.factor
         cc = int(col) // self.factor
         if not (0 <= cr < self.coarse_shape[0]
@@ -55,7 +74,16 @@ class ReachabilityField:
         return cr * self.coarse_shape[1] + cc
 
     def distances(self, rows, cols):
-        """Vectorized path length [m] for fine-grid cells (inf if none)."""
+        """Return path lengths to many fine-grid cells at once.
+
+        Args:
+            rows: Array of fine-grid row indices.
+            cols: Array of fine-grid column indices.
+
+        Returns:
+            Array of path lengths from the robot [m]; inf where a cell is
+            unreachable or outside the grid.
+        """
         cr = np.asarray(rows) // self.factor
         cc = np.asarray(cols) // self.factor
         ok = (
@@ -68,6 +96,11 @@ class ReachabilityField:
         return out
 
     def distance(self, row, col):
+        """Return the path length from the robot to one fine cell [m].
+
+        Returns:
+            Path length [m]; math.inf if unreachable or outside the grid.
+        """
         idx = self._index(row, col)
         if idx is None:
             return math.inf
@@ -75,6 +108,7 @@ class ReachabilityField:
         return d + self.start_offset_m if math.isfinite(d) else math.inf
 
     def _coarse_world(self, idx):
+        """Return the map-frame (x, y) of a coarse cell center [m]."""
         cr, cc = divmod(int(idx), self.coarse_shape[1])
         return (
             self.grid.origin_x + (cc + 0.5) * self.cell_m,
@@ -82,16 +116,31 @@ class ReachabilityField:
         )
 
     def path_direction(self, row, col, robot_x, robot_y, lookahead_m):
-        """Unit vector of the first `lookahead_m` of the path to a cell.
+        """Return the initial direction of the path to a cell.
 
-        This is the direction the robot would initially travel, which for an
-        omnidirectional base is independent of its chassis heading. Returns
-        None when no path exists.
+        Follows the shortest path back from the target to the point about
+        lookahead_m from the start, and returns the direction from the robot
+        to that point. This is the direction the robot would initially
+        travel, which for an omnidirectional base is independent of its
+        chassis heading; it feeds the directional continuity factor C.
+
+        Args:
+            row: Target fine-grid row.
+            col: Target fine-grid column.
+            robot_x: Robot x in the map frame [m].
+            robot_y: Robot y in the map frame [m].
+            lookahead_m: Path length that defines the initial direction [m].
+
+        Returns:
+            Unit vector (x, y) in the map frame, or None when no path
+            exists or the direction is undefined.
         """
         idx = self._index(row, col)
         if idx is None or not math.isfinite(float(self.dist[idx])):
             return None
 
+        # Walk back along predecessors; the guard bounds the loop even if
+        # the predecessor array were corrupted.
         node = idx
         guard = self.dist.size + 1
         while guard > 0:
@@ -113,6 +162,10 @@ class ReachabilityField:
 
 
 def _coarsen_any(mask, factor):
+    """Coarsen a mask by factor; a coarse cell is True if ANY fine cell is.
+
+    The grid is padded with False to a multiple of factor first.
+    """
     if factor <= 1:
         return mask
     h, w = mask.shape
@@ -127,6 +180,21 @@ def _coarsen_any(mask, factor):
 
 
 def _nearest_traversable(coarse, row, col, radius_cells):
+    """Find the traversable coarse cell nearest to (row, col).
+
+    Needed because the robot's own cell may lie inside an inflated obstacle
+    (for example right next to a wall).
+
+    Args:
+        coarse: Coarse traversability mask.
+        row: Coarse row of the robot.
+        col: Coarse column of the robot.
+        radius_cells: Search radius [coarse cells].
+
+    Returns:
+        Tuple (row, col, distance in cells), or None if no traversable
+        cell lies within the radius.
+    """
     h, w = coarse.shape
     r0 = max(0, row - radius_cells)
     r1 = min(h, row + radius_cells + 1)
@@ -147,6 +215,11 @@ def _nearest_traversable(coarse, row, col, radius_cells):
 
 
 def _dijkstra_scipy(coarse, start_index, cell_m):
+    """Run Dijkstra on the 8-connected coarse grid using SciPy.
+
+    Returns:
+        Tuple (dist, pred) of flat arrays; see ReachabilityField.
+    """
     h, w = coarse.shape
     idx = np.arange(h * w, dtype=np.int64).reshape(h, w)
 
@@ -187,6 +260,7 @@ def _dijkstra_scipy(coarse, start_index, cell_m):
 
 
 def _dijkstra_python(coarse, start_index, cell_m):
+    """Pure-Python Dijkstra, equivalent to _dijkstra_scipy()."""
     h, w = coarse.shape
     n = h * w
     dist = np.full(n, np.inf)
@@ -213,6 +287,7 @@ def _dijkstra_python(coarse, start_index, cell_m):
             if not flat[nb]:
                 continue
             if dr != 0 and dc != 0:
+                # Diagonal only if both side cells are free (no corner cut).
                 if not (flat[r * w + nc] and flat[nr * w + c]):
                     continue
             nd = d + cost
@@ -226,7 +301,30 @@ def _dijkstra_python(coarse, start_index, cell_m):
 def compute_reachability(grid, robot_x, robot_y, inflation_m,
                          coarse_resolution_m, start_search_m,
                          force_python=False):
-    """Build the distance field from the robot. Returns None on failure."""
+    """Compute path lengths from the robot to every reachable cell.
+
+    Free cells farther than inflation_m from any known obstacle are
+    traversable. The grid is coarsened optimistically, and a single
+    Dijkstra wavefront from the robot's cell then gives the path length to
+    all frontier candidates at once.
+
+    Args:
+        grid: GridMap holding the current occupancy grid.
+        robot_x: Robot x in the map frame [m].
+        robot_y: Robot y in the map frame [m].
+        inflation_m: Obstacle inflation radius [m]; keep it slightly below
+            the robot's inscribed radius.
+        coarse_resolution_m: Target coarse cell size [m]; reduced to
+            inflation_m when larger.
+        start_search_m: How far from the robot to look for a traversable
+            start cell [m].
+        force_python: Use the pure-Python Dijkstra even if SciPy exists
+            (for tests).
+
+    Returns:
+        A ReachabilityField, or None when no traversable cell lies within
+        start_search_m of the robot.
+    """
     res = grid.resolution
 
     traversable = grid.free & ~grid.obstacle_mask(inflation_m)

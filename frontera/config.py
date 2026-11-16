@@ -3,7 +3,7 @@ config.py — every tunable value of the exploration framework.
 
 The dataclass below is the single list of parameters. The ROS node declares
 one ROS 2 parameter per field (same name), so everything here can be set from
-the external exploration_manager.yaml without touching code.
+the external parameter file (config/frontera.yaml) without touching code.
 
 The defaults are robot-agnostic starting values. They are NOT experimentally
 optimized; the documentation for each parameter lives in the YAML file.
@@ -15,6 +15,14 @@ from typing import List
 
 @dataclass
 class ExplorationConfig:
+    """All framework parameters, with robot-agnostic defaults.
+
+    Each field becomes a ROS 2 parameter of the same name. Units follow the
+    suffix of the name (_m meters, _s seconds, _deg degrees, _rad radians,
+    _hz hertz, _m2 square meters, _pct percent). Call validate() after
+    filling the fields.
+    """
+
     # ── ROS interfaces ───────────────────────────────────────────────────
     map_topic: str = '/map'
     map_qos_transient_local: bool = True
@@ -104,9 +112,10 @@ class ExplorationConfig:
 
     # ── spatial exploration memory ───────────────────────────────────────
     region_match_radius_m: float = 0.75
-    # Controlled experimental policies; defaults reproduce the original v2.
-    # 'exact_goal' changes navigation-failure lookup ONLY; reachability and
-    # unproductive visits retain their normal spatial-region memory.
+    # Alternative policies used for ablation studies; the defaults are the
+    # framework's own behavior. 'exact_goal' changes the navigation-failure
+    # lookup ONLY; reachability and unproductive visits keep their normal
+    # spatial-region memory.
     failure_memory_policy: str = 'region'          # region | exact_goal
     failure_goal_quantization_m: float = 0.05      # world-coordinate bins
     failure_recovery_policy: str = 'progressive'    # progressive | fixed
@@ -173,7 +182,17 @@ class ExplorationConfig:
 
     # ---------------------------------------------------------------------
     def validate(self):
-        """Raise ValueError for values that cannot work; return warnings."""
+        """Check the parameters for values that cannot work.
+
+        Inconsistent but usable values produce warnings instead of errors;
+        reachability_inflation_m is clamped to goal_clearance_m when larger.
+
+        Returns:
+            List of warning strings (empty when everything is consistent).
+
+        Raises:
+            ValueError: If any parameter is out of its valid range.
+        """
         warnings = []
 
         def positive(name):
@@ -261,6 +280,12 @@ class ExplorationConfig:
 
     @classmethod
     def field_defaults(cls):
-        """Return {name: default} for every parameter (used by the node)."""
+        """Return the default value of every parameter.
+
+        Used by the ROS node to declare one parameter per field.
+
+        Returns:
+            Dictionary {parameter name: default value}.
+        """
         default = cls()
         return {f.name: getattr(default, f.name) for f in fields(cls)}

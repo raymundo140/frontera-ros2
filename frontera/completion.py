@@ -19,6 +19,10 @@ because no destination is selectable right now:
     selectable and no goal has been active for `stagnation_timeout_s` of
     running time, AND the map grew by less than `stagnation_min_growth_m2`
     over the progress window. Low map growth alone never ends a mission.
+
+TIME_LIMIT (max_exploration_time_s reached) and ERROR_NAV_UNRESPONSIVE (the
+navigation server stopped answering) are decided by the controller; the
+names are defined here so that all end classes live in one place.
 """
 
 from collections import deque
@@ -34,10 +38,31 @@ ERROR_NAV_UNRESPONSIVE = 'ERROR_NAV_UNRESPONSIVE'
 
 
 class MapProgress:
+    """Tracks known-map area and map change over time.
 
+    Attributes:
+        maps_received: Number of maps received so far.
+        known_area_m2: Known area of the latest map [m^2].
+        new_area_last_m2: Area change from the previous map [m^2].
+        growth_m2_min: Known-area growth rate over the last 60 s
+            [m^2/min], for status reporting only.
+        last_change_pct: Share of known cells changed since the previous
+            map [%], or None for the first map.
+        stable_maps: Consecutive maps whose change stayed below
+            map_stable_change_threshold_pct.
+        last_update_t: Behavior time of the latest map [s].
+    """
+
+    # Window of the reported growth rate [s], independent of the configured
+    # progress window used for stagnation.
     LEGACY_RATE_WINDOW_S = 60.0
 
     def __init__(self, cfg):
+        """Create an empty progress tracker.
+
+        Args:
+            cfg: ExplorationConfig.
+        """
         self.cfg = cfg
         self._history = deque()
         self._previous = None
@@ -51,6 +76,12 @@ class MapProgress:
         self.last_update_t = None
 
     def update(self, grid, now):
+        """Record a newly received map.
+
+        Args:
+            grid: GridMap of the new map.
+            now: Behavior time of reception [s].
+        """
         self.maps_received += 1
         area = grid.known_area_m2
         self.new_area_last_m2 = area - self.known_area_m2
@@ -80,14 +111,22 @@ class MapProgress:
             (area - old_area) * 60.0 / dt if dt > 1e-6 else 0.0)
 
     def _sample_at(self, t):
-        """Oldest stored sample that is not older than t."""
+        """Return the oldest stored (time, area) sample not older than t."""
         for sample in self._history:
             if sample[0] >= t:
                 return sample
         return self._history[-1]
 
     def growth_over_window(self, now):
-        """Known-area growth [m^2] over the configured progress window."""
+        """Return the known-area growth over the progress window.
+
+        Args:
+            now: Current behavior time [s].
+
+        Returns:
+            Growth of the known area over the last map_progress_window_s
+            [m^2]; 0.0 before the first map.
+        """
         if not self._history:
             return 0.0
         _, old_area = self._sample_at(
@@ -96,8 +135,22 @@ class MapProgress:
 
 
 class CompletionMonitor:
+    """Decides on evidence when exploration is over.
+
+    The controller calls evaluate() once per decision cycle with the
+    current count of candidates per class (see frontier_scoring).
+
+    Attributes:
+        no_candidate_maps: Consecutive new maps (or idle re-evaluations)
+            on which no explorable candidate was found.
+    """
 
     def __init__(self, cfg):
+        """Create a monitor with no evidence collected yet.
+
+        Args:
+            cfg: ExplorationConfig.
+        """
         self.cfg = cfg
         self.no_candidate_maps = 0
         self._last_map_seq = -1
@@ -105,17 +158,41 @@ class CompletionMonitor:
         self._last_count_time = 0.0
 
     def note_activity(self, run_time):
-        """A goal was dispatched or finished: exploration is not stagnant."""
+        """Record that a goal was dispatched or finished.
+
+        Resets the stagnation timer, since exploration is evidently active.
+
+        Args:
+            run_time: Running exploration time [s] (excludes pauses).
+        """
         self._last_activity = float(run_time)
 
     def evaluate(self, counts, map_seq, run_time, window_growth_m2,
                  selectable=False):
-        """Return None, or {'class': ..., 'reason': ...} when it is over."""
+        """Decide whether exploration has ended.
+
+        Args:
+            counts: Dictionary {candidate class: number of candidates} for
+                the current decision cycle.
+            map_seq: Sequence number of the map the counts come from.
+            run_time: Running exploration time [s] (excludes pauses).
+            window_growth_m2: Known-area growth over the progress window
+                [m^2], from MapProgress.growth_over_window().
+            selectable: True if a candidate (including an unreachability
+                probe) could be dispatched now; used only by the
+                single_no_eligible ablation policy.
+
+        Returns:
+            None while exploration continues; otherwise a dictionary
+            {'class': end class, 'reason': human-readable explanation}.
+        """
         if self.cfg.completion_policy == 'single_no_eligible':
-            # Valid decision cycle is guaranteed by the controller (map and
-            # fresh robot pose). Never terminate while a probe is selectable.
-            # This deliberately ignores cooling/blocked evidence to measure
-            # false positive completion against the full framework.
+            # Ablation policy: end on the first cycle without a selectable
+            # frontier. The controller only calls this with a valid map and
+            # a fresh robot pose, and it never ends while a probe is
+            # selectable. Cooling and blocked frontiers are deliberately
+            # ignored, to measure premature completion against the full
+            # evidence-based policy.
             if not selectable and counts.get(fs.ELIGIBLE, 0) == 0:
                 return {
                     'class': COMPLETE,

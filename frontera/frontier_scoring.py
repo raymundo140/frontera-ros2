@@ -42,7 +42,20 @@ BLOCKING_CLASSES = (ELIGIBLE, TEMPORARILY_BLOCKED, COOLDOWN)
 
 
 def continuity_factor(preferred_direction, candidate_direction, weight):
-    """Return (cosine or None, C). C = 1 when no direction is known."""
+    """Compute the directional continuity factor C of a candidate.
+
+    Args:
+        preferred_direction: Unit vector (x, y) of the robot's recent travel
+            direction in the map frame, or None if not yet known.
+        candidate_direction: Unit vector (x, y) of the initial direction of
+            the path to the candidate in the map frame, or None.
+        weight: Continuity weight w_c, in [0, 1).
+
+    Returns:
+        Tuple (cosine, C): the cosine of the angle between both directions
+        (None if either is unknown) and C = 1 + w_c * cosine, which is 1.0
+        when no direction is known.
+    """
     if preferred_direction is None or candidate_direction is None:
         return None, 1.0
     cosine = (
@@ -55,8 +68,23 @@ def continuity_factor(preferred_direction, candidate_direction, weight):
 
 def utility(gain_norm, path_m, travel_lambda,
             continuity=1.0, recent=1.0, visit=1.0):
+    """Compute the utility U of a candidate (see the module docstring).
+
+    Args:
+        gain_norm: Normalized information gain; clipped to [0, 1].
+        path_m: Obstacle-aware path length to the candidate [m]; negative
+            values are treated as 0.
+        travel_lambda: Travel-cost rate lambda [1/m].
+        continuity: Directional continuity factor C.
+        recent: Recent-goal factor R.
+        visit: Unproductive-visit factor V.
+
+    Returns:
+        The non-negative utility U.
+    """
     gain_norm = max(0.0, min(1.0, float(gain_norm)))
     path_m = max(0.0, float(path_m))
+    # Bounded exponent: beyond ~700 the factor is negligible (< 1e-300).
     exponent = min(float(travel_lambda) * path_m, 700.0)
     return (
         gain_norm * math.exp(-exponent) *

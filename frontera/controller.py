@@ -52,15 +52,18 @@ from .navigation_supervisor import NavigationSupervisor
 from .reachability import compute_reachability
 from .timebase import BehaviorClock
 
+# Control states, changed only by operator commands (and the end of a run).
 STATE_WAITING = 'WAITING'
 STATE_RUNNING = 'RUNNING'
 STATE_PAUSED = 'PAUSED'
 STATE_STOPPED = 'STOPPED'
 
+# Identifier of the JSON event format published on the events topic.
 EVENT_SCHEMA = 'exploration_event/1'
 FRAMEWORK_VERSION = 2
 
-# Visit classifications (after the post-arrival map check).
+# Outcome classifications reported in the event stream. A reached goal is
+# classified only after the map has settled around it (see _evaluate_visit).
 PRODUCTIVE_SUCCESS = 'PRODUCTIVE_SUCCESS'
 UNPRODUCTIVE_SUCCESS = 'UNPRODUCTIVE_SUCCESS'
 UNVERIFIED_SUCCESS = 'UNVERIFIED_SUCCESS'
@@ -70,7 +73,16 @@ INTENTIONAL_CANCELLATION = 'INTENTIONAL_CANCELLATION'
 
 
 def _num(value, digits=4):
-    """JSON-safe number: None for NaN / inf / missing."""
+    """Convert a value to a JSON-safe rounded number.
+
+    Args:
+        value: Number-like value, or None.
+        digits: Decimal places to keep.
+
+    Returns:
+        The rounded float, or None for missing, non-numeric, NaN or
+        infinite values.
+    """
     if value is None:
         return None
     try:
@@ -83,8 +95,43 @@ def _num(value, digits=4):
 
 
 class ExplorationController:
+    """The exploration decision loop.
+
+    The ROS node forwards maps, commands and navigation callbacks to the
+    on_*/nav_* methods and calls the four timer methods: tick() at
+    decision_rate_hz, rotation_tick() at rotation_control_rate_hz,
+    status_tick() at status_rate_hz, and wall_tick() on a wall-clock timer.
+
+    Attributes:
+        cfg: ExplorationConfig.
+        ctrl_state: Control state (WAITING, RUNNING, PAUSED or STOPPED).
+        ended: True once exploration has ended; the node must be
+            relaunched for a new run.
+        end_class: End class (COMPLETE, COMPLETE_PARTIAL, STAGNATED,
+            TIME_LIMIT or an ERROR_* class), empty while running.
+        completion_reason: Human-readable reason for the end.
+        needs_selection: True when the next tick should select a goal.
+        grid: GridMap of the latest map, or None.
+        costmap: GridMap of the latest global costmap, or None.
+        memory: ExplorationMemory.
+        progress: MapProgress.
+        completion: CompletionMonitor.
+        supervisor: NavigationSupervisor executing the current goal.
+    """
 
     def __init__(self, cfg, ports):
+        """Create a controller in the WAITING state.
+
+        Validates the configuration and logs its warnings.
+
+        Args:
+            cfg: ExplorationConfig.
+            ports: Interface to the outside world (see the module
+                docstring for the required methods).
+
+        Raises:
+            ValueError: If the configuration is invalid.
+        """
         for warning in cfg.validate():
             ports.log('warn', f'Configuration: {warning}')
 
@@ -158,6 +205,11 @@ class ExplorationController:
     # helpers
     # =====================================================================
     def _now(self):
+        """Read both clocks and return (behavior time, wall time) [s].
+
+        Also handles a backward ROS-time jump: the TF buffer is cleared and
+        the jump is reported once.
+        """
         wall = self.p.wall_now()
         t = self.clock.update(self.p.ros_now(), wall)
         if self.clock.consume_reset():
@@ -172,20 +224,34 @@ class ExplorationController:
         return t, wall
 
     def _motion_allowed(self):
+        """True while exploration is running and has not ended."""
         return self.ctrl_state == STATE_RUNNING and not self.ended
 
     def _rotation_clear(self, x, y, radius_m):
+        """True if no known obstacle lies within radius_m of (x, y)."""
         if self.grid is None:
             return False
         return self.grid.is_clear(x, y, radius_m)
 
     def _log_throttled(self, key, period_s, level, text):
+        """Log a message at most once per period_s of wall time per key."""
         wall = self.p.wall_now()
         if wall - self._throttle.get(key, -1e18) >= period_s:
             self._throttle[key] = wall
             self.p.log(level, text)
 
     def _emit(self, event, data=None, txn_id=None):
+        """Publish one framework event as a JSON object.
+
+        Every event carries a sequence number, all relevant timestamps,
+        the transaction ID and the control state, so a run can be
+        reconstructed from the event stream alone.
+
+        Args:
+            event: Event name (for example 'GOAL_SELECTED').
+            data: Event-specific dictionary.
+            txn_id: Transaction ID; defaults to the active transaction.
+        """
         self._event_seq += 1
         payload = {
             'schema': EVENT_SCHEMA,
@@ -208,6 +274,14 @@ class ExplorationController:
     # inputs
     # =====================================================================
     def on_map(self, grid):
+        """Receive a new occupancy grid.
+
+        Updates map progress, re-checks whether the active goal's frontier
+        is already resolved, and requests a new selection when idle.
+
+        Args:
+            grid: GridMap of the new map; its seq is assigned here.
+        """
         now, wall = self._now()
         self._map_seq += 1
         grid.seq = self._map_seq
@@ -223,9 +297,20 @@ class ExplorationController:
             self.needs_selection = True
 
     def on_costmap(self, grid):
+        """Receive a new global costmap (GridMap), used only as a veto."""
         self.costmap = grid
 
     def on_command(self, text):
+        """Handle an operator command from the control topic.
+
+        START begins or resumes exploration, PAUSE cancels the active goal
+        and holds, STOP ends this run, SAVE_MAP requests a map save, and
+        RESET_NAV_FAULT is acknowledged but never releases an unconfirmed
+        goal.
+
+        Args:
+            text: Command string (case-insensitive).
+        """
         cmd = str(text).strip().upper()
         now, wall = self._now()
 
@@ -291,15 +376,18 @@ class ExplorationController:
 
     # navigation callbacks: forwarded with their transaction ID
     def nav_goal_response(self, txn_id, accepted, handle, error=None):
+        """Forward a goal response; see NavigationSupervisor."""
         now, wall = self._now()
         self.supervisor.on_goal_response(
             txn_id, accepted, handle, error, now, wall)
 
     def nav_feedback(self, txn_id, distance_remaining, recoveries):
+        """Forward navigation feedback; see NavigationSupervisor."""
         self.supervisor.on_feedback(
             txn_id, distance_remaining, recoveries, self.clock.t)
 
     def nav_result(self, txn_id, status, error=None):
+        """Forward a navigation result; see NavigationSupervisor."""
         now, _ = self._now()
         self.supervisor.on_result(txn_id, status, error, now)
 
@@ -307,13 +395,19 @@ class ExplorationController:
     # timers
     # =====================================================================
     def rotation_tick(self):
+        """Run the rotate-first controller while a rotation is active."""
         if self.supervisor.phase != ns.ROTATING:
             return
         now, wall = self._now()
         self.supervisor.rotation_tick(now, wall)
 
     def wall_tick(self):
-        """Runs on a wall-clock timer, so it fires even if ROS time stops."""
+        """Watch the ROS clock and enforce wall-clock deadlines.
+
+        Runs on a wall-clock timer, so it fires even if ROS time stops. A
+        frozen clock halts any direct rotation command, since no
+        behavior-time deadline can expire while it is frozen.
+        """
         now, wall = self._now()
         frozen = self.clock.is_frozen(wall)
         if frozen and not self._frozen:
@@ -332,12 +426,21 @@ class ExplorationController:
         self.supervisor.tick(now, wall)
 
     def status_tick(self):
+        """Publish the status string and the statistics line."""
         self._now()
         self.p.publish_status(self.status_text())
         self.p.publish_stats(self.stats_text())
 
     def tick(self):
-        """The single supervisory gate (decision_rate_hz)."""
+        """Run one decision cycle: the single supervisory gate.
+
+        Called at decision_rate_hz. In order: advance the active
+        transaction, track the pose, enforce the fault and time limits,
+        finish a pending end, evaluate a settled visit, release expired
+        cooldowns, and, only when no transaction is active, select a new
+        goal. Selection happens nowhere else, so callbacks can never
+        start a goal.
+        """
         now, wall = self._now()
         dt = 0.0 if self._last_tick_t is None else max(0.0, now - self._last_tick_t)
         self._last_tick_t = now
@@ -423,6 +526,14 @@ class ExplorationController:
     # pose tracking (dashboard distance + travel direction)
     # =====================================================================
     def _track_pose(self, pose):
+        """Accumulate traveled distance and update the travel direction.
+
+        A jump larger than pose_jump_reject_m is treated as a localization
+        correction, not motion.
+
+        Args:
+            pose: (x, y, yaw) in the map frame, or None.
+        """
         self._last_pose = pose
         if pose is None:
             return
@@ -446,6 +557,7 @@ class ExplorationController:
     # frontier re-evaluation while navigating
     # =====================================================================
     def _goal_gain(self, grid, goal_x, goal_y, bearing):
+        """Estimate the information gain at a goal [m^2]."""
         return estimate_gain_m2(
             grid, goal_x, goal_y,
             self.cfg.sensor_range_m,
@@ -455,6 +567,12 @@ class ExplorationController:
             self.cfg.gain_ray_step_m)
 
     def _reevaluate_active_goal(self, grid, now, wall):
+        """Vote on whether the active goal's frontier is already resolved.
+
+        The frontier counts as resolved on this map when its remaining
+        gain falls below the larger of min_information_gain_m2 and
+        resolved_gain_fraction of the gain at selection.
+        """
         txn = self.supervisor.txn
         if txn is None:
             return
@@ -477,7 +595,19 @@ class ExplorationController:
     # selection
     # =====================================================================
     def _costmap_ok(self, xs, ys):
-        """Costmap VETO: reject only explicit high-cost cells."""
+        """Apply the costmap veto to candidate points.
+
+        Only explicit high-cost cells (>= costmap_reject_cost) are rejected;
+        unknown or out-of-costmap points are left to the map check. The
+        veto is disabled when the costmap frame differs from the map frame.
+
+        Args:
+            xs: Array of x coordinates in the map frame [m].
+            ys: Array of y coordinates in the map frame [m].
+
+        Returns:
+            Boolean array; True where the point passes the veto.
+        """
         cm = self.costmap
         if cm is None:
             return np.ones(xs.shape, dtype=bool)
@@ -503,6 +633,31 @@ class ExplorationController:
 
     def _evaluate_cluster(self, cluster, grid, field, clear_mask,
                           rx, ry, now, timing):
+        """Turn one frontier cluster into a classified, scored candidate.
+
+        Steps: reject cells near the map edge or too close to obstacles,
+        apply the costmap veto, pick the reachable frontier cell nearest the
+        cluster centroid as the goal, measure its path length and initial
+        direction, estimate its information gain, consult the exploration
+        memory, assign a candidate class, and compute the utility of
+        eligible candidates and probe candidates.
+
+        Args:
+            cluster: FrontierCluster to evaluate.
+            grid: GridMap of the current map.
+            field: ReachabilityField from the robot, or None if unavailable
+                (straight-line distance is then used).
+            clear_mask: Obstacle mask inflated by goal_clearance_m.
+            rx: Robot x in the map frame [m].
+            ry: Robot y in the map frame [m].
+            now: Current behavior time [s].
+            timing: Dictionary of accumulated timings [ms]; updated.
+
+        Returns:
+            Candidate dictionary with the goal position ('world_x',
+            'world_y'), class ('cls'), reason, gain, path length, utility
+            and the factors that produced it.
+        """
         cfg = self.cfg
         rows, cols = cluster.rows, cluster.cols
         cx, cy = grid.cell_to_world(cluster.centroid_row, cluster.centroid_col)
@@ -612,10 +767,10 @@ class ExplorationController:
                     'x': _num(rec.x), 'y': _num(rec.y),
                     'cause': 'path_found'})
 
-        # Failure state is isolated from spatial reachability / visit memory.
+        # Failure state is kept apart from spatial reachability / visit memory.
         failure_rec = self.memory.find_failure(wx, wy)
 
-        # ── classification ───────────────────────────────────────────────
+        # ── classification (first matching rule wins) ────────────────────
         near_metric = path if reachable else euclid
         if gain < cfg.min_information_gain_m2:
             cand['cls'], cand['reason'] = fs.LOW_INFORMATION_GAIN, 'low_gain'
@@ -669,6 +824,19 @@ class ExplorationController:
         return cand
 
     def _select(self, now, wall, pose):
+        """Run the full frontier pipeline and dispatch the best candidate.
+
+        Detects and clusters frontiers, computes one shared reachability
+        field, evaluates every cluster, and selects the eligible candidate
+        of highest utility; if none is eligible, the best probe candidate
+        is tried instead. When nothing is selectable, the completion
+        monitor decides whether exploration has ended.
+
+        Args:
+            now: Current behavior time [s].
+            wall: Current monotonic wall time [s].
+            pose: Robot pose (x, y, yaw) in the map frame, or None.
+        """
         cfg = self.cfg
         grid = self.grid
 
@@ -819,6 +987,11 @@ class ExplorationController:
         self._dispatch(best, grid, pose, now, wall)
 
     def _dispatch(self, best, grid, pose, now, wall):
+        """Start a goal transaction for the selected candidate.
+
+        Records the known map around the goal before the visit, which is
+        later compared with the map after arrival to judge productivity.
+        """
         cfg = self.cfg
         goal = dict(best)
         goal['map_seq'] = grid.seq
@@ -872,6 +1045,18 @@ class ExplorationController:
     # transaction outcome
     # =====================================================================
     def _on_transaction_finished(self, txn, outcome):
+        """Classify a finished transaction and update the memory.
+
+        REACHED and RESOLVED goals start the settle phase, after which the
+        visit is judged productive or not. FAILED goals are recorded as
+        navigation failures (cooldown, exhaustion or confirmed
+        unreachability). CANCELED goals are intentional and leave the
+        memory unchanged.
+
+        Args:
+            txn: The finished Transaction.
+            outcome: Outcome dictionary from NavigationSupervisor.
+        """
         now = self.clock.t
         goal = txn.goal
         kind = outcome['kind']
@@ -940,6 +1125,11 @@ class ExplorationController:
 
     # ── productive vs unproductive visits ────────────────────────────────
     def _begin_settle(self, goal, kind, txn_id, now):
+        """Wait for the map to settle after arrival before judging the visit.
+
+        The visit is evaluated after settle_maps new maps or
+        settle_timeout_s, whichever comes first.
+        """
         self._settle = {
             'goal': goal, 'kind': kind, 'txn_id': txn_id,
             'seq': self._map_seq,
@@ -949,6 +1139,7 @@ class ExplorationController:
             self._evaluate_visit(now)
 
     def _process_settle(self, now):
+        """Evaluate the pending visit once the map has settled."""
         settle = self._settle
         if settle is None:
             return
@@ -957,7 +1148,14 @@ class ExplorationController:
             self._evaluate_visit(now)
 
     def _evaluate_visit(self, now):
-        """Did reaching this frontier add map near it?"""
+        """Judge whether reaching a frontier revealed enough new map.
+
+        A visit revealing at least min_productive_gain_m2 within
+        productivity_radius_m of the goal is productive and clears the
+        region's history. A visit after which no new map arrived is
+        unverified and carries no penalty. Any other visit is unproductive
+        and lowers the region's value, eventually exhausting it.
+        """
         settle = self._settle
         self._settle = None
         goal = settle['goal']
@@ -1017,6 +1215,7 @@ class ExplorationController:
     # end of exploration
     # =====================================================================
     def _summary(self):
+        """Return the end-of-run summary published with the final event."""
         return {
             'class': self.end_class,
             'reason': self.completion_reason,
@@ -1054,6 +1253,16 @@ class ExplorationController:
         }
 
     def _end(self, end_class, reason):
+        """End exploration once and for all.
+
+        Publishes the final event with a run summary and, if
+        request_map_save_on_complete is set, requests a map save.
+
+        Args:
+            end_class: COMPLETE, COMPLETE_PARTIAL, STAGNATED, TIME_LIMIT or
+                an ERROR_* class.
+            reason: Human-readable reason.
+        """
         if self.ended:
             return
         self.ended = True
@@ -1094,7 +1303,11 @@ class ExplorationController:
             self.p.log('info', 'Automatic map save disabled')
 
     def _save_map(self):
-        """Ask the program manager to save the map; never write files here."""
+        """Ask the external process owner to save the map.
+
+        The framework never writes files itself; it publishes a request on
+        map_save_request_topic for the launcher or program manager.
+        """
         self.p.publish_map_save_status(
             f'Map save requested ({self.cfg.map_save_topic})...')
         self.p.request_map_save()
@@ -1103,6 +1316,12 @@ class ExplorationController:
     # status + stats
     # =====================================================================
     def status_text(self):
+        """Return the one-word status published on the status topic.
+
+        With legacy_complete_status set, every non-error end is reported as
+        COMPLETE for compatibility with existing supervisors; the exact end
+        class is still available in the statistics and events.
+        """
         if self.ended:
             if self.end_class.startswith('ERROR'):
                 return self.end_class
@@ -1135,10 +1354,11 @@ class ExplorationController:
         return 'IDLE'
 
     def stats_text(self):
-        """Flat key=value CSV.
+        """Return the statistics line published on the stats topic.
 
-        The first block reproduces every field of the original framework in
-        the same order and format; new fields are appended after it.
+        A flat, comma-separated list of key=value pairs. The first block
+        keeps the fields and order of the framework's first version, so
+        existing monitors keep working; newer fields are appended after it.
         """
         now = self.clock.t
         nan = float('nan')

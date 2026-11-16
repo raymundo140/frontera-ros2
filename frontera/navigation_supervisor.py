@@ -19,8 +19,9 @@ Safety properties enforced here:
 * An unanswered cancel is retried, then escalated to FAULT. FAULT is never
   cleared by a timer, a transient action-server disconnect, or a manual
   acknowledgement: only a confirmed terminal result may release its goal.
-  Recovery without a result requires the Program Manager to stop/restart
-  the navigation stack and explorer together, not dispatch a new goal.
+  Recovery without a result requires the process supervisor (for example a
+  program manager) to stop and restart the navigation stack and explorer
+  together, not dispatch a new goal.
 * Every phase has a deadline in behavior time (simulation-safe), and the
   phases that depend on an external component also have a wall-clock bound.
 
@@ -32,6 +33,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+# Transaction phases (see the diagram above).
 IDLE = 'IDLE'
 PREVIEW = 'PREVIEW'
 ROTATING = 'ROTATING'
@@ -51,17 +53,61 @@ RESULT_SUCCEEDED = 'SUCCEEDED'
 RESULT_CANCELED = 'CANCELED'
 RESULT_ABORTED = 'ABORTED'
 
+# Cancel reasons that turn a canceled/aborted result into REACHED, RESOLVED
+# or FAILED; any other cancel reason yields CANCELED.
 REASON_REACHED = 'reached_threshold'
 REASON_RESOLVED = 'frontier_resolved'
 FAILURE_REASONS = ('budget_exceeded', 'no_progress')
 
 
 def _wrap(angle):
+    """Wrap an angle to [-pi, pi] [rad]."""
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
 @dataclass
 class Transaction:
+    """State of one goal transaction, from selection to a confirmed end.
+
+    Times are behavior time [s] unless the name contains 'wall'.
+
+    Attributes:
+        id: Unique transaction ID; every navigation callback carries it.
+        goal: Goal dictionary from the controller ('world_x', 'world_y',
+            'path_m', ...).
+        t_begin: Time the transaction began.
+        preview_until: End of the preview phase.
+        rot_target: Target heading of the rotate-first phase [rad].
+        rot_start: Time the rotation began, or None if skipped.
+        rot_deadline: Rotation timeout.
+        rot_best: Smallest heading error reached so far [rad].
+        rot_mark: Time of the last rotation progress.
+        rot_pose_lost: Time the pose was lost during rotation, or None.
+        handle: Navigation goal handle once accepted.
+        nav_start: Time the goal was sent, or None if never sent.
+        budget_s: Time budget of the goal.
+        budget_deadline: Current budget deadline (moves on extension).
+        extensions: Budget extensions used.
+        response_deadline: Deadline for the accept/reject response.
+        response_wall_deadline: Same deadline in wall time.
+        progress_mark: Time of the last observed progress.
+        progress_xy: Robot (x, y) at the last progress [m].
+        best_remaining: Smallest distance remaining reported [m].
+        last_remaining: Latest distance remaining reported [m].
+        recoveries: Recovery behaviors reported by the navigation stack.
+        recovery_graces_used: Recoveries that reset the progress timer.
+        resolved_votes: Consecutive maps on which the frontier looked
+            resolved.
+        cancel_reason: Why a cancel was requested, or None.
+        cancel_attempts: Cancel requests sent.
+        cancel_deadline: Deadline for the cancel confirmation.
+        cancel_wall_deadline: Same deadline in wall time.
+        preview_s: Duration of the preview phase.
+        rotation_s: Duration of the rotation phase.
+        nav_s: Duration of the navigation phase.
+        notes: Free-form notes for the event log.
+    """
+
     id: int
     goal: dict
     t_begin: float
@@ -101,9 +147,41 @@ class Transaction:
 
 
 class NavigationSupervisor:
+    """Runs one goal transaction at a time and decides when it is over.
+
+    The controller starts a transaction with begin(), drives it with tick()
+    and rotation_tick(), and forwards the navigation callbacks; the
+    supervisor reports the outcome once through on_finished.
+
+    Attributes:
+        phase: Current phase (IDLE, PREVIEW, ROTATING, SENDING, NAVIGATING,
+            CANCELING or FAULT).
+        txn: The active Transaction, or None when IDLE.
+        fault_since: Behavior time FAULT was entered [s], or None.
+        fault_reason: Why FAULT was entered.
+        total_preview_s: Accumulated preview time over all goals [s].
+        total_rotation_s: Accumulated rotation time over all goals [s].
+        total_nav_s: Accumulated navigation time over all goals [s].
+        stale_callbacks: Callbacks received for finished transactions.
+    """
 
     def __init__(self, cfg, ports, motion_allowed, on_finished, emit,
                  rotation_clear):
+        """Create an idle supervisor.
+
+        Args:
+            cfg: ExplorationConfig.
+            ports: Interface to the outside world (pose, navigation action,
+                velocity command, goal marker, logging); provided by the
+                ROS node or by a test double.
+            motion_allowed: Callable returning True while exploration is
+                running; checked before every motion command.
+            on_finished: Callable(txn, outcome) invoked once per finished
+                transaction.
+            emit: Callable(event, data, txn_id) that logs a framework event.
+            rotation_clear: Callable(x, y, radius_m) returning True if the
+                robot can rotate in place without touching a known obstacle.
+        """
         self.cfg = cfg
         self.p = ports
         self._motion_allowed = motion_allowed
@@ -126,20 +204,39 @@ class NavigationSupervisor:
 
     @property
     def busy(self):
+        """True while a transaction is active (phase other than IDLE)."""
         return self.phase != IDLE
 
     @property
     def txn_id(self):
+        """ID of the active transaction, or 0 when IDLE."""
         return self.txn.id if self.txn is not None else 0
 
     @property
     def next_txn_id(self):
+        """ID the next transaction will receive."""
         return self._next_id
 
     # =====================================================================
     # start
     # =====================================================================
     def begin(self, goal, now, wall):
+        """Start a new transaction for a selected goal.
+
+        Publishes the goal marker, then enters PREVIEW (if goal_preview_s
+        is positive) or goes straight to rotation and dispatch.
+
+        Args:
+            goal: Goal dictionary; receives the key 'txn_id'.
+            now: Current behavior time [s].
+            wall: Current monotonic wall time [s].
+
+        Returns:
+            The new transaction ID.
+
+        Raises:
+            RuntimeError: If a transaction is already active.
+        """
         if self.busy:
             raise RuntimeError('begin() while a transaction is active')
 
@@ -163,6 +260,15 @@ class NavigationSupervisor:
     # periodic entry points
     # =====================================================================
     def tick(self, now, wall):
+        """Advance the active transaction; called at decision_rate_hz.
+
+        Ends the preview, enforces the response deadline, supervises
+        navigation progress, retries unanswered cancels and observes FAULT.
+
+        Args:
+            now: Current behavior time [s].
+            wall: Current monotonic wall time [s].
+        """
         phase = self.phase
         if phase == PREVIEW:
             if not self._motion_allowed():
@@ -182,7 +288,18 @@ class NavigationSupervisor:
             self._check_fault(now)
 
     def rotation_tick(self, now, wall):
-        """High-rate rotate-first controller (direct angular velocity)."""
+        """Run one step of the rotate-first controller.
+
+        Called at rotation_control_rate_hz. Commands a proportional angular
+        velocity toward the target heading, bounded by the configured
+        minimum and maximum, and ends the rotation when it is done, times
+        out, stalls, or the pose is lost for too long; the goal is then
+        sent to the navigation stack in every case.
+
+        Args:
+            now: Current behavior time [s].
+            wall: Current monotonic wall time [s].
+        """
         if self.phase != ROTATING:
             return
         txn = self.txn
@@ -228,7 +345,10 @@ class NavigationSupervisor:
         self.p.cmd_rotate(wz)
 
     def halt_direct_motion(self):
-        """Emergency stop of the direct rotation command (frozen clock)."""
+        """Stop the direct rotation command immediately.
+
+        Used when the ROS clock freezes, since no deadline can then expire.
+        """
         if self.phase == ROTATING:
             self.p.cmd_rotate(0.0)
 
@@ -236,6 +356,12 @@ class NavigationSupervisor:
     # rotate-first
     # =====================================================================
     def _start_rotation(self, now, wall):
+        """End the preview and begin rotate-first, or skip it and send.
+
+        Rotation is skipped when disabled, when no pose is available, when
+        the robot already faces the frontier, or when there is not enough
+        clearance to turn in place.
+        """
         txn = self.txn
         cfg = self.cfg
         txn.preview_s = float(now) - txn.t_begin
@@ -281,12 +407,14 @@ class NavigationSupervisor:
         self.phase = ROTATING
 
     def _stop_rotation(self, now):
+        """Command zero angular velocity and record the rotation time."""
         self.p.cmd_rotate(0.0)
         txn = self.txn
         if txn is not None and txn.rot_start is not None:
             txn.rotation_s = float(now) - txn.rot_start
 
     def _end_rotation(self, now, wall, abort_reason):
+        """Finish rotate-first (logging any abort reason) and send the goal."""
         self._stop_rotation(now)
         if abort_reason is not None:
             self._emit(
@@ -300,6 +428,13 @@ class NavigationSupervisor:
     # dispatch
     # =====================================================================
     def _budget(self, goal):
+        """Return the time budget of a goal [s].
+
+        budget = nav_budget_base_s + nav_budget_factor * path / speed,
+        clamped to [nav_budget_min_s, nav_budget_max_s], where path is the
+        wavefront path length to the goal [m] and speed is
+        expected_speed_mps.
+        """
         cfg = self.cfg
         path = max(0.0, float(goal.get('path_m', 0.0)))
         budget = (
@@ -308,6 +443,12 @@ class NavigationSupervisor:
         return max(cfg.nav_budget_min_s, min(cfg.nav_budget_max_s, budget))
 
     def _send(self, now, wall):
+        """Send the goal to the navigation stack and enter SENDING.
+
+        Finishes the transaction instead when exploration is no longer
+        running, when the robot is already within goal_reached_distance_m,
+        or when the navigation server is unavailable.
+        """
         txn = self.txn
         cfg = self.cfg
         goal = txn.goal
@@ -362,9 +503,18 @@ class NavigationSupervisor:
     # supervision while navigating
     # =====================================================================
     def _mark_progress(self, now):
+        """Reset the no-progress timer."""
         self.txn.progress_mark = float(now)
 
     def _supervise(self, now, wall):
+        """Check an active navigation goal for arrival, budget and progress.
+
+        The goal is canceled as reached within goal_reached_distance_m.
+        When the budget expires, it is extended once by half if the robot
+        progressed recently, and canceled otherwise. Without
+        progress_min_improvement_m of progress for progress_timeout_s, it
+        is canceled as no_progress.
+        """
         txn = self.txn
         cfg = self.cfg
         goal = txn.goal
@@ -405,10 +555,16 @@ class NavigationSupervisor:
             self.request_cancel('no_progress', now, wall)
 
     def vote_resolved(self, resolved, now, wall):
-        """Called once per new map while navigating.
+        """Count one map's evidence that the target frontier is resolved.
 
-        The frontier must look resolved on several CONSECUTIVE maps before
-        the goal is canceled, so occupancy-grid noise cannot cancel goals.
+        Called once per new map while navigating. The frontier must look
+        resolved on resolved_confirm_maps CONSECUTIVE maps before the goal
+        is canceled, so occupancy-grid noise cannot cancel goals.
+
+        Args:
+            resolved: True if the frontier looks resolved on this map.
+            now: Current behavior time [s].
+            wall: Current monotonic wall time [s].
         """
         if self.phase != NAVIGATING:
             return
@@ -421,7 +577,21 @@ class NavigationSupervisor:
     # cancellation
     # =====================================================================
     def request_cancel(self, reason, now, wall):
-        """Ask for the active transaction to stop. Returns True if active."""
+        """Ask the active transaction to stop.
+
+        Before a goal exists (PREVIEW, ROTATING) the transaction ends
+        immediately. A goal in flight (SENDING) is canceled as soon as it is
+        accepted. An active goal (NAVIGATING) enters CANCELING and stays
+        there until the navigation stack confirms a terminal result.
+
+        Args:
+            reason: Cancel reason; decides how the result is classified.
+            now: Current behavior time [s].
+            wall: Current monotonic wall time [s].
+
+        Returns:
+            True if a transaction was active, False when IDLE.
+        """
         phase = self.phase
         txn = self.txn
         if phase == IDLE or txn is None:
@@ -451,6 +621,7 @@ class NavigationSupervisor:
         return True
 
     def _send_cancel(self, now, wall):
+        """Send one cancel request and arm its confirmation deadlines."""
         txn = self.txn
         txn.cancel_attempts += 1
         txn.cancel_deadline = float(now) + self.cfg.cancel_timeout_s
@@ -462,6 +633,7 @@ class NavigationSupervisor:
         self.p.nav_cancel(txn.handle)
 
     def _check_cancel(self, now, wall):
+        """Retry an unconfirmed cancel, then escalate to FAULT."""
         txn = self.txn
         if now < txn.cancel_deadline and wall < txn.cancel_wall_deadline:
             return
@@ -474,6 +646,7 @@ class NavigationSupervisor:
     # fault
     # =====================================================================
     def _enter_fault(self, reason, now):
+        """Enter FAULT: no new goal until a terminal result arrives."""
         self.phase = FAULT
         self.fault_since = float(now)
         self.fault_reason = reason
@@ -528,9 +701,24 @@ class NavigationSupervisor:
     # asynchronous navigation callbacks (all carry their transaction ID)
     # =====================================================================
     def _is_current(self, txn_id):
+        """True if txn_id belongs to the active transaction."""
         return self.txn is not None and int(txn_id) == self.txn.id
 
     def on_goal_response(self, txn_id, accepted, handle, error, now, wall):
+        """Handle the navigation stack's accept/reject response.
+
+        A response for an older transaction is ignored, and an orphan goal
+        it reports as accepted is canceled. A transport error enters FAULT,
+        since it does not prove the goal was rejected.
+
+        Args:
+            txn_id: Transaction the response belongs to.
+            accepted: True if the goal was accepted.
+            handle: Goal handle, used to cancel the goal later.
+            error: Exception raised while sending, or None.
+            now: Current behavior time [s].
+            wall: Current monotonic wall time [s].
+        """
         if not self._is_current(txn_id):
             self.stale_callbacks += 1
             if accepted and handle is not None:
@@ -586,6 +774,19 @@ class NavigationSupervisor:
         txn.progress_mark = float(now)
 
     def on_feedback(self, txn_id, distance_remaining, recoveries, now):
+        """Handle navigation feedback.
+
+        A drop in the remaining distance of at least
+        progress_min_improvement_m counts as progress. A new recovery
+        behavior resets the progress timer, at most
+        progress_recovery_graces times per goal.
+
+        Args:
+            txn_id: Transaction the feedback belongs to.
+            distance_remaining: Remaining path length reported [m].
+            recoveries: Number of recoveries reported so far.
+            now: Current behavior time [s].
+        """
         if not self._is_current(txn_id) or self.phase != NAVIGATING:
             return
         txn = self.txn
@@ -618,6 +819,19 @@ class NavigationSupervisor:
             self._emit('NAV_RECOVERY', {'recoveries': recoveries}, txn.id)
 
     def on_result(self, txn_id, status, error, now):
+        """Handle the terminal navigation result and finish the transaction.
+
+        The raw status is combined with the cancel reason to classify the
+        outcome as REACHED, RESOLVED, FAILED or CANCELED. Only a verified
+        terminal status releases the transaction; a transport error or an
+        unknown status enters FAULT instead.
+
+        Args:
+            txn_id: Transaction the result belongs to.
+            status: RESULT_SUCCEEDED, RESULT_CANCELED or RESULT_ABORTED.
+            error: Exception raised while retrieving the result, or None.
+            now: Current behavior time [s].
+        """
         if not self._is_current(txn_id):
             self.stale_callbacks += 1
             self._emit('STALE_CALLBACK',
@@ -667,6 +881,15 @@ class NavigationSupervisor:
     # finish
     # =====================================================================
     def _finish(self, kind, reason, now, detail=None, status=None):
+        """Close the active transaction and report its outcome.
+
+        Args:
+            kind: REACHED, RESOLVED, FAILED or CANCELED.
+            reason: Reason string for the event log.
+            now: Current behavior time [s].
+            detail: Optional extra information.
+            status: Raw navigation result status, if any.
+        """
         txn = self.txn
         if txn is None:
             return

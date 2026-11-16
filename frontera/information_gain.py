@@ -26,13 +26,40 @@ import numpy as np
 
 
 def reference_gain_m2(sensor_range_m, fov_rad):
-    """Area of the full sensor footprint; used to normalize gain to [0, 1]."""
+    """Return the area of the full sensor footprint.
+
+    Used to normalize the information gain to [0, 1].
+
+    Args:
+        sensor_range_m: Sensor range [m].
+        fov_rad: Horizontal field of view [rad].
+
+    Returns:
+        Footprint area 0.5 * fov * range^2 [m^2].
+    """
     return 0.5 * float(fov_rad) * float(sensor_range_m) ** 2
 
 
 def estimate_gain_m2(grid, x, y, sensor_range_m, fov_rad=2.0 * math.pi,
                      view_bearing=0.0, num_rays=72, step_m=0.0):
-    """Return the visible unknown area [m^2] from (x, y)."""
+    """Estimate the unknown area visible from a viewpoint.
+
+    Args:
+        grid: GridMap holding the current occupancy grid.
+        x: Viewpoint x in the map frame [m].
+        y: Viewpoint y in the map frame [m].
+        sensor_range_m: Sensor range [m].
+        fov_rad: Horizontal field of view [rad]; capped at 2*pi.
+        view_bearing: Direction the sensor faces in the map frame [rad];
+            only relevant when fov_rad is below 2*pi.
+        num_rays: Number of rays spread evenly over the field of view.
+        step_m: Sample spacing along each ray [m]; 0 uses the map
+            resolution, and values below half a cell are raised to it.
+
+    Returns:
+        Visible unknown area [m^2]; an optimistic upper bound (see the
+        module docstring).
+    """
     res = grid.resolution
     step = float(step_m) if step_m and step_m > 0.0 else res
     step = max(step, res * 0.5)
@@ -61,6 +88,8 @@ def estimate_gain_m2(grid, x, y, sensor_range_m, fov_rad=2.0 * math.pi,
     values = np.full(rows.shape, -1, dtype=np.int16)    # outside = unknown
     values[inside] = grid.grid[rows[inside], cols[inside]]
 
+    # A sample is occluded once any earlier sample on the same ray (row of
+    # the array) was occupied; the running maximum propagates that along r.
     blocked = values >= grid.occupied_min
     occluded = np.maximum.accumulate(blocked, axis=1)
 
