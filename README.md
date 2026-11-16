@@ -2,10 +2,13 @@
 
 **Supervised frontier exploration for ROS 2.**
 
+
 Frontera drives a mobile robot through an unknown indoor environment until the
 map is complete. It decides where the robot should go next, supervises every
-navigation goal until it ends, remembers which regions have failed or proved
-unproductive, and decides on evidence when exploration is finished.
+navigation goal until it ends, and is built on five mechanisms: transactional
+goal execution, path- and information-aware selection, progress-aware
+supervision, unified spatial exploration memory, and evidence-based
+completion.
 
 It is a single ROS 2 node. It needs no specific robot, SLAM system, or
 navigation stack, only three standard interfaces:
